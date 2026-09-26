@@ -1,0 +1,35 @@
+# Environment / secrets
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Data / artifacts
+data/local_index.json
+data/local_index.pkl
+data/long_term_memory.json
+*.log
+logs/
+
+# Assessment brief (not part of the deliverable source)
+Lead AI Assignment.pdf
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/

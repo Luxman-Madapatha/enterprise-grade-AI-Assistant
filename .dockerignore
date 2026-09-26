@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+data/local_index.json
+data/long_term_memory.json
+*.log
