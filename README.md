@@ -12,7 +12,7 @@ patterns, observability, security controls and production-ready engineering**.
 
 ---
 
-## ✨ What's implemented
+##  What's implemented
 
 | Area | Implementation |
 | --- | --- |
