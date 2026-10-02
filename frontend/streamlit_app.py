@@ -86,7 +86,6 @@ def render_activity_event(event: dict) -> str:
     if etype == "agent_state":
         node = payload.get("node", "?")
         msg = payload.get("message", "")
-        icon = "🧭" if node == "supervisor" else "🔄"
         return f"**`{node}`** — {msg}"
     if etype == "tool_call":
         status = payload.get("status", "?")
@@ -144,6 +143,17 @@ st.caption(
     f"Signed in as **{user['username']}** (role: `{user['role']}`) · "
     "Activity panel on the right shows exactly what the agent is doing."
 )
+
+# Admin dashboard link for admin role.
+role = user.get("role")
+if role in {"administrator", "admin"}:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Admin")
+    st.sidebar.markdown(
+        "<a href='http://localhost:8502' target='_blank'>Open Admin Dashboard</a>",
+        unsafe_allow_html=True,
+    )
+    st.sidebar.caption("Run: `streamlit run frontend/admin_dashboard.py --server.port 8502`")
 
 col_chat, col_activity = st.columns([3, 2])
 
