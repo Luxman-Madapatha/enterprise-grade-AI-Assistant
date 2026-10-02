@@ -1,41 +1,48 @@
 # LangGraph usage and implementation
 
-This repository uses LangGraph as the orchestration layer for the enterprise assistant. The model is not responsible for deciding the entire workflow by itself; instead, LangGraph coordinates routing, state updates, retrieval, research loops, and final response generation.
+This repository uses LangGraph as the orchestration layer for an enterprise AI assistant. The LLM is not the only decision-maker; LangGraph coordinates state, retrieval, tool execution, multi-step research, and answer validation in a bounded workflow.
 
 The implementation lives primarily in:
-- `app/agents/graph.py` — graph assembly and routing
-- `app/agents/state.py` — structured workflow state
+- `app/agents/graph.py` — graph assembly, edges, and loop routing
+- `app/agents/state.py` — typed workflow state
 - `app/agents/supervisor.py` — intent classification and routing
-- `app/agents/retrieval.py` — direct-answer retrieval path
-- `app/agents/research.py` — recursive multi-step investigation path
-- `app/agents/response.py` — final answer generation and validation
+- `app/agents/retrieval.py` — direct retrieval path
+- `app/agents/research.py` — Recursive Language Model (RLM) workflow
+- `app/agents/response.py` — answer generation and guardrails
 
-## 1. Core design: a stateful graph, not a freeform chat loop
+## 1. Graph assembly and workflow shape
 
-The graph is built with `StateGraph(AgentState)` and compiled with `MemorySaver()`:
+The graph is created with `StateGraph(AgentState)` and compiled with `MemorySaver()`:
 
 ```python
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
 graph = StateGraph(AgentState)
-# add nodes
-# add edges
-# compile with checkpointing
+
+graph.add_node("supervisor", supervisor_node)
+graph.add_node("retrieval_agent", retrieval_agent_node)
+graph.add_node("research_plan", research_plan_node)
+graph.add_node("research_step", research_step_node)
+graph.add_node("research_aggregate", research_aggregate_node)
+graph.add_node("response_agent", response_agent_node)
+
+graph.set_entry_point("supervisor")
+...
 return graph.compile(checkpointer=MemorySaver())
 ```
 
 This gives the system:
-- persistent session memory across turns
-- deterministic transition logic between nodes
-- conditional branching based on state
-- resumable execution with checkpoints per session/thread
+- session persistence across turns
+- structured state transitions between steps
+- conditional branching based on route decisions
+- checkpointed execution for auditability and debugging
 
 The graph entry point is always the `supervisor` node.
 
-## 2. Shared state model
+## 2. State model used by the graph
 
-The workflow state is defined in `app/agents/state.py` using a typed dictionary. It includes both conversation context and workflow metadata.
+The workflow state is defined in `app/agents/state.py`:
 
 ```python
 class AgentState(TypedDict, total=False):
@@ -60,19 +67,19 @@ class AgentState(TypedDict, total=False):
     errors: Annotated[list[str], lambda a, b: (a or []) + (b or [])]
 ```
 
-Important details:
-- `messages` uses `add_messages`, so chat history is merged correctly.
-- `route` decides which downstream path to take: `retrieval_agent`, `research_plan`, or `response_agent`.
-- `research_queue` and `research_index` power the recursive research loop.
-- `retrieved_chunks` and `research_findings` become evidence for the final answer.
+Important state fields:
+- `intent` and `route` come from the supervisor
+- `plan` is the task decomposition output
+- `research_queue` stores pending sub-queries
+- `research_index` tracks progress through the queue
+- `research_findings` stores each tool result and status
+- `retrieved_chunks` are flattened evidence for final answer generation
 
-## 3. Supervisor node: intent classification and routing
+## 3. Supervisor and routing model
 
-The `supervisor_node` in `app/agents/supervisor.py` is the entry point for every user request.
+The first node is `supervisor_node` in `app/agents/supervisor.py`.
 
-It decides the request type by:
-- deterministic keyword matching, or
-- an LLM-based classification fallback if the LLM is available
+It uses a deterministic classifier first, then optionally an LLM-based classification when the model is configured:
 
 ```python
 async def supervisor_node(state: AgentState) -> dict[str, Any]:
@@ -87,60 +94,65 @@ async def supervisor_node(state: AgentState) -> dict[str, Any]:
     return {"intent": intent, "plan": plan, "route": route}
 ```
 
-The routing rules are intentionally concrete:
-- `direct_question` -> `retrieval_agent`
-- `research` or `external_lookup` -> `research_plan`
-- `chitchat` -> `response_agent`
+The route targets are:
+- `retrieval_agent`
+- `research_plan`
+- `response_agent`
 
-This keeps the graph safe and explainable instead of letting a single model decide the full workflow in one giant prompt.
+The supervisor maps user intent into workflow routing:
+- factual/simple question -> retrieval path
+- multi-document or analytic question -> RLM research path
+- external employee/service/incident lookup -> research path
+- greeting or general chatter -> response path
 
-### Deterministic routing examples
+## 4. Direct retrieval path
 
-The classifier checks for domain-specific signals such as:
-- research keywords like `compare`, `analyze`, `root cause`, `across all`, `report`
-- external lookup signals like `who works`, `employee`, `on-call`, `service catalog`
-- simple chat triggers like `hello`, `thanks`, `what can you do`
+For direct questions, the graph routes to `retrieval_agent` defined in `app/agents/retrieval.py`.
 
-If the LLM is unavailable, the system falls back to this deterministic strategy.
-
-## 4. Graph topology and execution flow
-
-The graph is defined in `app/agents/graph.py`:
+This node runs a single retrieval step and returns evidence chunks for the answer stage:
 
 ```python
-def build_graph():
-    graph = StateGraph(AgentState)
+async def retrieval_agent_node(state: AgentState) -> dict[str, Any]:
+    query = state["user_query"]
+    role = state["user"]["role"]
+    session_id = state["session_id"]
 
-    graph.add_node("supervisor", supervisor_node)
-    graph.add_node("retrieval_agent", retrieval_agent_node)
-    graph.add_node("research_plan", research_plan_node)
-    graph.add_node("research_step", research_step_node)
-    graph.add_node("research_aggregate", research_aggregate_node)
-    graph.add_node("response_agent", response_agent_node)
-
-    graph.set_entry_point("supervisor")
-
-    graph.add_conditional_edges(
-        "supervisor",
-        _route_after_supervisor,
-        {
-            ROUTE_RETRIEVAL: "retrieval_agent",
-            ROUTE_RESEARCH: "research_plan",
-            ROUTE_RESPONSE: "response_agent",
-        },
+    result = await execute_tool(
+        session_id,
+        TOOL_KNOWLEDGE_SEARCH,
+        role,
+        {"query": query, "top_k": settings.top_k},
     )
+
+    if not result.success:
+        return {"retrieved_chunks": []}
+
+    chunks = result.output.get("results", []) if isinstance(result.output, dict) else []
+    return {"retrieved_chunks": chunks}
 ```
 
-After that:
-- `retrieval_agent` flows directly into `response_agent`
-- `research_plan` leads to `research_step`
-- `research_step` loops until the queue is exhausted or the max step count is reached
-- `research_aggregate` then routes to `response_agent`
-- `response_agent` terminates the graph with `END`
+This is a single-shot hybrid retrieval workflow: it retrieves candidate chunks and passes them directly to the response node.
 
-### Research loop routing
+## 5. RLM implementation: recursive multi-step research
 
-The recursive research path is bounded:
+The repository’s deeper workflow is the Recursive Language Model (RLM) implementation in `app/agents/research.py`.
+
+This is not a generic LLM chain. It is a bounded research loop that:
+1. breaks down the user request into sub-queries,
+2. executes those sub-queries via tools,
+3. re-queues more granular follow-ups when a search is still broad,
+4. aggregates findings into a deduplicated evidence set,
+5. passes evidence to the final response node.
+
+### 5.1 Research step budget
+
+The recursion is controlled by a hard cap:
+
+```python
+MAX_RESEARCH_STEPS = 8
+```
+
+The loop condition is defined in `graph.py`:
 
 ```python
 def _route_after_research_step(state: AgentState) -> str:
@@ -151,63 +163,43 @@ def _route_after_research_step(state: AgentState) -> str:
     return "research_aggregate"
 ```
 
-This prevents unbounded reasoning. The max research budget is defined as:
+This is the key safety property of the RLM design: it prevents infinite loops and keeps research bounded.
+
+### 5.2 Planning the research queue
+
+The `research_plan_node` creates the initial investigation queue from the supervisor plan or a default fallback:
 
 ```python
-MAX_RESEARCH_STEPS = 8
+async def research_plan_node(state: AgentState) -> dict[str, Any]:
+    session_id = state["session_id"]
+    plan = list(state.get("plan") or [])
+    if not plan:
+        plan = [
+            f"{state['user_query']} - overview",
+            f"{state['user_query']} - evidence",
+        ]
+
+    return {
+        "research_queue": plan,
+        "research_index": 0,
+        "research_findings": [],
+    }
 ```
 
-## 5. Retrieval path: direct-answer workflow
+This creates a structured set of sub-queries before any tool calls are made.
 
-The `retrieval_agent_node` in `app/agents/retrieval.py` handles simple factual or single-document questions.
+### 5.3 Tool selection per research question
 
-It executes a knowledge search tool using the current role and the user query:
-
-```python
-result = await execute_tool(
-    session_id,
-    TOOL_KNOWLEDGE_SEARCH,
-    role,
-    {"query": query, "top_k": settings.top_k},
-)
-```
-
-If successful, it returns the matched `results` as `retrieved_chunks`:
+The system decides which tool to use based on the sub-query wording.
 
 ```python
-chunks = result.output.get("results", []) if isinstance(result.output, dict) else []
-return {"retrieved_chunks": chunks}
-```
-
-This path is optimized for low-latency retrieval of evidence for direct questions.
-
-## 6. Research path: recursive language-model workflow (RLM)
-
-The research flow is implemented in `app/agents/research.py` and is the main advanced workflow in the project.
-
-### 6.1 Planning the investigation
-
-`research_plan_node` decomposes the user request into targeted sub-queries:
-
-```python
-plan = list(state.get("plan") or [])
-if not plan:
-    plan = [f"{state['user_query']} - overview", f"{state['user_query']} - evidence"]
-
-return {
-    "research_queue": plan,
-    "research_index": 0,
-    "research_findings": [],
+_MCP_HINTS = {
+    TOOL_MCP_EMPLOYEE: ["employee", "who is", "who works", "works in", "directory"],
+    TOOL_MCP_SERVICE: ["service", "catalog", "owns", "owner", "sla", "status of service"],
+    TOOL_MCP_INCIDENT: ["incident record", "incident list", "sev1", "sev2", "sev3"],
 }
-```
 
-This creates a structured investigation plan before deeper retrieval begins.
 
-### 6.2 Research step execution
-
-`research_step_node` executes each sub-query one by one. It picks a tool based on query hints:
-
-```python
 def _choose_tool(sub_query: str) -> str:
     q = sub_query.lower()
     for tool, hints in _MCP_HINTS.items():
@@ -216,22 +208,63 @@ def _choose_tool(sub_query: str) -> str:
     return TOOL_KNOWLEDGE_SEARCH
 ```
 
-The system routes queries to:
-- `knowledge_search` for internal enterprise documents
-- `mcp_employee`, `mcp_service`, or `mcp_incident` for external structured lookups
+This means:
+- internal document lookups usually go through `knowledge_search`
+- employee/service metadata lookups use MCP tools
+- incident-related queries can use the incident tool
 
-Each research step stores a finding entry:
+### 5.4 Research step execution
+
+Each step processes one queued query and records the result:
+
+```python
+async def research_step_node(state: AgentState) -> dict[str, Any]:
+    session_id = state["session_id"]
+    role = state["user"]["role"]
+    queue: list[str] = list(state.get("research_queue") or [])
+    idx = int(state.get("research_index") or 0)
+    findings: list[dict[str, Any]] = list(state.get("research_findings") or [])
+
+    if idx >= len(queue) or idx >= MAX_RESEARCH_STEPS:
+        return {"research_index": idx, "research_findings": findings}
+
+    sub_query = queue[idx]
+    tool_name = _choose_tool(sub_query)
+
+    result = await execute_tool(
+        session_id,
+        tool_name,
+        role,
+        {"query": sub_query, "top_k": settings.top_k},
+    )
+```
+
+The step records a result object such as:
 
 ```python
 entry = {"sub_query": sub_query, "tool": tool_name}
 if result.success:
     entry["output"] = output
     entry["status"] = "success"
+else:
+    entry["status"] = "error"
+    entry["error"] = result.error
 ```
 
-### 6.3 Recursive exploration
+The findings are appended to the state and the queue index increments:
 
-When a search yields a near-full result page and there are still new chunks discovered, the system automatically broadens the query by splitting it into finer sub-queries:
+```python
+findings.append(entry)
+return {
+    "research_queue": queue,
+    "research_findings": findings,
+    "research_index": idx + 1,
+}
+```
+
+### 5.5 Recursive expansion of broad search results
+
+This is the most important part of the RLM implementation. When a knowledge search returns a full page of new results, the system broadens the investigation into a more specific follow-up plan instead of blindly continuing with the same question.
 
 ```python
 def _split_query(query: str) -> list[str]:
@@ -243,11 +276,33 @@ def _split_query(query: str) -> list[str]:
     return [f"{query} - {s}" for s in suffixes]
 ```
 
-This is the core recursive behavior: if the current evidence is incomplete or the search result is broad, the graph re-queues narrower research questions instead of continuing a single noisy sweep.
+And in the step logic:
 
-### 6.4 Aggregation and deduplication
+```python
+if tool_name == TOOL_KNOWLEDGE_SEARCH and isinstance(output, dict):
+    hits = len(output.get("results", []))
+    new_ids = {r.get("chunk_id") for r in output.get("results", []) if r.get("chunk_id")}
+    if (
+        hits >= settings.top_k
+        and (new_ids - seen_ids)
+        and (len(queue) - idx) < MAX_RESEARCH_STEPS
+    ):
+        new_queries = _split_query(sub_query)
+        queue.extend(new_queries)
+```
 
-The `research_aggregate_node` collects all findings and flattens them into deduplicated chunks:
+This creates a recursive refinement loop:
+- initial query is broad
+- search returns many useful hits
+- new sub-queries are generated for root cause, impact, and resolution
+- those queries are added back to the queue
+- the loop continues until the queue is exhausted or the step cap is reached
+
+This is effectively a bounded RLM-style search-decompose-expand loop.
+
+### 5.6 Deduplication and aggregation
+
+Before the final answer, the research findings are aggregated and deduplicated:
 
 ```python
 def _flatten_chunks(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -262,17 +317,31 @@ def _flatten_chunks(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(chunks.values())
 ```
 
-This ensures the evidence passed to the final answer is compact and free of repeated results.
+This keeps the evidence set readable, compact, and resistant to repeated chunk retrieval.
 
-## 7. Response agent: final answer and validation
+### 5.7 Optional structured analysis
 
-The final stage is the `response_agent_node` in `app/agents/response.py`.
+The aggregate stage can also perform structured analysis, but only when the role is authorized.
 
-It:
-- loads the evidence (`retrieved_chunks` and `research_findings`)
-- calls the LLM if configured
-- otherwise falls back to a deterministic template answer
-- validates citations and content safety with `guard_answer`
+```python
+if is_tool_allowed(role_enum, TOOL_PYTHON_ANALYSIS) and findings:
+    result = await execute_tool(
+        session_id,
+        TOOL_PYTHON_ANALYSIS,
+        role,
+        {"code": "sum(1 for f in data['findings'] if f['status'] == 'success')", "data": data},
+    )
+```
+
+This gives researchers a deterministic analysis capability for summarizing count-like findings without broadening the workflow to unrestricted Python execution.
+
+## 6. Final response generation
+
+Once the research loop ends, the graph routes to `response_agent`. That node:
+- takes the flattened evidence
+- optionally asks the LLM to answer with citations
+- otherwise uses a deterministic template answer
+- runs safety filtering with `guard_answer`
 
 ```python
 if settings.llm_available:
@@ -284,64 +353,30 @@ valid_ids = {c["chunk_id"] for c in chunks if c.get("chunk_id")}
 guard = guard_answer(answer, citations, valid_ids)
 ```
 
-This is where the graph enforces the "evidence first" design. It does not allow unsupported or ungrounded answer content to pass through unchecked.
+This ensures the final output remains grounded and traceable.
 
-## 8. Observability and event streaming
+## 7. Why this is a real RLM pattern
 
-The system emits structured events during each node execution via `publish_event(...)`.
+The repository’s RLM implementation is structured like a real recursive planning-and-search loop:
+- search plan generated from the user request
+- evidence gathered from sub-queries
+- loop expands or narrows based on result quality and breadth
+- results are deduplicated and summarized
+- workflow is bounded by `MAX_RESEARCH_STEPS`
+- output is validated before delivery
 
-Examples include:
-- `agent_state`
-- `retrieval`
-- `validation`
+In other words, this is not just a long prompt chain. It is a stateful agent loop using graph transitions, evidence tracking, and controlled recursion.
 
-This gives the frontend or operators a real-time trace of:
-- which node is running
-- what the supervisor decided
-- how many retrieval hits were found
-- whether research is recursing
-- whether the final answer passed validation
+## 8. End-to-end RLM flow
 
-This is important for enterprise settings where auditability matters as much as intelligence.
+The actual end-to-end flow is:
 
-## 9. Why this is a good LangGraph implementation
+1. `supervisor` decides route
+2. `research_plan` initializes the queue
+3. `research_step` executes current sub-query
+4. if search results are broad, `_split_query()` creates finer sub-queries
+5. loop continues until completion or max budget reached
+6. `research_aggregate` deduplicates evidence
+7. `response_agent` produces the final answer
 
-This repo uses LangGraph in a way that matches strong production patterns:
-
-- graph-based orchestration instead of monolithic prompting
-- typed workflow state instead of implicit memory
-- conditional transitions for routing logic
-- bounded loops to avoid runaway recursion
-- checkpointing for session continuity
-- event-driven observability for debugging and auditing
-- tool execution under explicit role-based permission checks
-
-In short, LangGraph is the control plane while the LLM and retrieval tools are the execution layer.
-
-## 10. Execution summary
-
-A typical request follows this path:
-
-1. `supervisor` classifies the question and picks a route.
-2. `retrieval_agent` executes hybrid retrieval for direct questions.
-3. `research_plan` breaks complex questions into sub-queries.
-4. `research_step` executes those sub-queries in a bounded recursive loop.
-5. `research_aggregate` consolidates findings.
-6. `response_agent` produces the final answer and runs validation.
-7. `END` closes the graph.
-
-This design keeps the assistant safe, explainable, auditable, and operationally robust for enterprise use.
-
-## 11. Repo-specific file map
-
-- `app/agents/graph.py` — graph assembly and routing topology
-- `app/agents/state.py` — typed workflow state
-- `app/agents/supervisor.py` — intent classification and routing
-- `app/agents/retrieval.py` — single-shot hybrid retrieval
-- `app/agents/research.py` — recursive RLM investigation loop
-- `app/agents/response.py` — answer generation and safety checks
-- `app/agents/tool_runner.py` — tool dispatch and permission enforcement
-- `app/auth/rbac.py` — authorization controls
-- `app/security/guardrails.py` — output validation
-
-This repo is a practical example of LangGraph being used as a workflow engine for an enterprise AI assistant with retrieval, multi-step research, and guardrailed response generation.
+This is the central advanced workflow of the assistant and is the clearest expression of the project’s LangGraph design.
